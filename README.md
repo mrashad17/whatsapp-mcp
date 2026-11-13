@@ -1,5 +1,23 @@
 # WhatsApp MCP Server
 
+> **Fork notes (mrashad17): security fixes**
+>
+> Upstream's bridge listened on every network interface with no authentication, accepted requests from web pages, could send any file on the computer, and saved downloaded documents under a name chosen by the sender. This fork changes that:
+> - The bridge API listens on `127.0.0.1` only and requires a random token. The token is created on first run in `whatsapp-bridge/store/api_token` (mode 600), and the Python server reads it automatically.
+> - Requests must be JSON, use a localhost `Host` header, and carry no browser `Origin` header. This blocks attacks from web pages (CSRF and DNS rebinding).
+> - **Files can only be sent from the outbox folder**, `~/WhatsApp-MCP-Outbox`, which is created automatically. Set `WHATSAPP_MCP_OUTBOX` to use a different folder; set it the same way for both the bridge and the Claude Desktop config.
+> - Downloaded file names are cleaned, so a sender can't make the bridge write outside `store/`.
+> - `store/` is mode 700, and the databases and media files are mode 600. `store/` is in `.gitignore`.
+> - Message text is no longer printed to the terminal.
+> - `get_direct_chat_by_contact` matches the full number exactly instead of any chat containing those digits.
+> - Requests to the bridge time out, and converted voice notes are deleted after sending.
+> - The MCP tools tell the model that message text is untrusted data, not instructions.
+> - Python dependencies were upgraded (`pip-audit`: no known vulnerabilities). The MCP SDK is pinned below 2.0.
+>
+> Tests: `cd whatsapp-bridge && go test ./...` and `cd whatsapp-mcp-server && uv run --with pytest pytest tests`.
+> Go dependencies were **not** upgraded in this change. Before relying on the bridge, run `go build ./...`, `go test ./...` and `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` on your Mac.
+
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
@@ -39,7 +57,7 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
@@ -99,7 +117,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go
+   go run .
    ```
 
 Without this setup, you'll likely run into errors like:

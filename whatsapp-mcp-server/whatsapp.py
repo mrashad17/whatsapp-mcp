@@ -1,4 +1,5 @@
 import sqlite3
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -7,8 +8,56 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store')
+MESSAGES_DB_PATH = os.path.join(STORE_DIR, 'messages.db')
+API_TOKEN_PATH = os.path.join(STORE_DIR, 'api_token')
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+# (connect timeout, read timeout) in seconds; media uploads can take a while
+REQUEST_TIMEOUT = (5, 600)
+
+
+def get_outbox_dir() -> str:
+    """The only folder files may be sent from (must match the Go bridge)."""
+    configured = os.environ.get("WHATSAPP_MCP_OUTBOX", "").strip()
+    outbox = configured or os.path.join(os.path.expanduser("~"), "WhatsApp-MCP-Outbox")
+    os.makedirs(outbox, mode=0o700, exist_ok=True)
+    return os.path.realpath(outbox)
+
+
+def check_media_path(media_path: str) -> str:
+    """Return the real path of media_path if it is a file inside the outbox.
+
+    Raises ValueError otherwise. The bridge enforces the same rule; this check
+    gives a clear error before anything is sent.
+    """
+    if not media_path:
+        raise ValueError("Media path must be provided")
+    outbox = get_outbox_dir()
+    real = os.path.realpath(media_path)
+    if os.path.commonpath([outbox, real]) != outbox:
+        raise ValueError(f"Files can only be sent from {outbox}. Copy the file there first.")
+    if not os.path.isfile(real):
+        raise ValueError(f"Media file not found: {media_path}")
+    return real
+
+
+def _api_headers() -> dict:
+    """Auth header for the bridge. The bridge creates the token on first run."""
+    try:
+        with open(API_TOKEN_PATH, encoding="utf-8") as f:
+            token = f.read().strip()
+    except FileNotFoundError:
+        raise RuntimeError("Bridge API token not found. Start the WhatsApp bridge first.")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _post(endpoint: str, payload: dict) -> requests.Response:
+    return requests.post(
+        f"{WHATSAPP_API_BASE_URL}/{endpoint}",
+        json=payload,
+        headers=_api_headers(),
+        timeout=REQUEST_TIMEOUT,
+    )
 
 @dataclass
 class Message:
@@ -597,9 +646,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid = ?
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, (f"{re.sub(r'[^0-9]', '', sender_phone_number)}@s.whatsapp.net",))
         
         chat_data = cursor.fetchone()
         
@@ -628,13 +677,12 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = _post("send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -656,19 +704,17 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        try:
+            media_path = check_media_path(media_path)
+        except ValueError as e:
+            return False, str(e)
+
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = _post("send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -685,30 +731,31 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    temp_file = None
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
         
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
+        try:
+            media_path = check_media_path(media_path)
+        except ValueError as e:
+            return False, str(e)
 
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
+                # Converted file goes in the outbox so the bridge accepts it
+                media_path = audio.convert_to_opus_ogg_temp(media_path, output_dir=get_outbox_dir())
+                temp_file = media_path
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = _post("send", payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -723,6 +770,10 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+    finally:
+        # Remove the converted copy; the user's original file is untouched
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
@@ -735,13 +786,12 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         The local file path if download was successful, None otherwise
     """
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
-        response = requests.post(url, json=payload)
+
+        response = _post("download", payload)
         
         if response.status_code == 200:
             result = response.json()
